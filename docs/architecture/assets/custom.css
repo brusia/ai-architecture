@@ -1,0 +1,19 @@
+/* Перенос длинных названий систем в боковом меню (в колонке они иначе обрезаются) */
+.menu-list a,
+.listree-submenu-heading {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    height: auto;
+}
+
+/* Чуть шире колонка меню под длинные имена MVP/Production */
+.site-layout {
+    grid-template-columns: 340px 1fr;
+}
+
+/* Убрать дублирующую ссылку "Software Systems" из раздела General:
+   ниже уже есть полноценный блок-дерево "Software systems" */
+.menu-label + .menu-list a[href="software-systems/"] {
+    display: none;
+}

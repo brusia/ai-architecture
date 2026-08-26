@@ -1,0 +1,172 @@
+openapi: 3.0.3
+info:
+  title: AI Service API — интеграция библиотеки migration
+  version: 0.1.0
+  description: |
+    Спецификация взаимодействия агента (Qwen Code) с "AI Service".
+
+    Единственный реальный сетевой контракт — /v1/chat/completions: Qwen Code
+    общается с локально развёрнутой LLM по OpenAI-compatible протоколу. Остальной
+    "протокол" системы — файловый (навигатор AGENTS.md, phase-файлы, METADATA
+    пакета) и не является сетевым API. Сбор контекста, подбор фазы и промптинг
+    выполняет сам агент локально — отдельного доменного HTTP-эндпоинта нет.
+
+servers:
+  - url: http://{host}:{port}/v1
+    description: Локально развёрнутая LLM (OpenAI-compatible endpoint)
+    variables:
+      host:
+        default: localhost
+        description: Хост self-hosted сервера LLM
+      port:
+        default: "8000"
+        description: Порт OpenAI-compatible сервера
+
+tags:
+  - name: llm
+    description: Фактический транспорт агент → LLM (OpenAI-compatible)
+
+paths:
+  /chat/completions:
+    post:
+      tags: [llm]
+      operationId: createChatCompletion
+      summary: Фактический вызов локальной LLM (OpenAI-compatible)
+      description: |
+        Так Qwen Code реально обращается к "AI Service". Промпт собирается
+        агентом из текущей фазы протокола, кодстайла и контекста репозитория.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: Ответ модели
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ModelUnavailable'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Ключ self-hosted сервера. Может быть любой непустой строкой, если сервер
+        не проверяет ключ (см. инструкции eai-migrate-guide -d).
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Неверный или отсутствующий ключ
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ModelUnavailable:
+      description: LLM недоступна (сервер не поднят / перегружен)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    # ---------- OpenAI-compatible (фактический контракт) ----------
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: Имя модели, обслуживаемой сервером
+          example: qwen2.5-coder-32b-instruct
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          default: 0.2
+        max_tokens:
+          type: integer
+          minimum: 1
+          example: 4096
+        stream:
+          type: boolean
+          default: false
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+
+    ChatCompletionResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          example: chat.completion
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                $ref: '#/components/schemas/ChatMessage'
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter]
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    Usage:
+      type: object
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
