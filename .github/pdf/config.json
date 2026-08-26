@@ -1,0 +1,11 @@
+{
+  "stylesheet": [".github/pdf/style.css"],
+  "pdf_options": {
+    "format": "A4",
+    "margin": "18mm 16mm",
+    "printBackground": true
+  },
+  "launch_options": {
+    "args": ["--no-sandbox", "--disable-gpu"]
+  }
+}

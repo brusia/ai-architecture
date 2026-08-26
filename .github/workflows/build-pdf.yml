@@ -1,0 +1,41 @@
+name: Build strategy PDF
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Chromium system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 libpango-1.0-0 libcairo2
+
+      - name: Generate PDF
+        run: |
+          npx --yes md-to-pdf \
+            --config-file .github/pdf/config.json \
+            docs/strategy_and_roadmap/strategy.md
+          test -f docs/strategy_and_roadmap/strategy.pdf
+
+      - name: Attach PDF to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: docs/strategy_and_roadmap/strategy.pdf
