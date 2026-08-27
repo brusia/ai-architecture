@@ -1,0 +1,41 @@
+name: Build strategy PDF
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Chrome
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          install-dependencies: true
+
+      - name: Generate PDF
+        env:
+          PUPPETEER_EXECUTABLE_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          npx --yes md-to-pdf \
+            --config-file .github/pdf/config.json \
+            docs/strategy_and_roadmap/strategy.md
+          test -f docs/strategy_and_roadmap/strategy.pdf
+
+      - name: Attach PDF to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: docs/strategy_and_roadmap/strategy.pdf
