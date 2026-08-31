@@ -1,0 +1,55 @@
+name: Build C4 site
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - docs/architecture/**
+      - .github/workflows/build-c4-site.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate static C4 site
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/var/model" \
+            -w /var/model \
+            ghcr.io/avisi-cloud/structurizr-site-generatr:latest \
+            generate-site \
+              --workspace-file docs/architecture/workspace.dsl \
+              --assets-dir docs/architecture/assets \
+              --output-dir build/site \
+              --default-branch main
+          test -f build/site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,502 @@
+openapi: 3.0.3
+info:
+  title: AI Service API (Production) — интеграция библиотеки migration на Hermes
+  version: 1.0.0
+  description: |
+    Контракт взаимодействия с production-версией "AI Service" (Hermes, гибридная
+    топология: Local Gateway + Central Gateway + self-hosted LLM).
+
+    Реальные сетевые контракты:
+      1. LLM transport — фактический OpenAI-compatible вызов Local Gateway →
+         self-hosted LLM (/v1/chat/completions). Унаследован из MVP.
+      2. Ops — эксплуатационные эндпоинты Gateway: /healthz, /readyz, /metrics.
+      3. Sync — синхронизация Local ↔ Central Gateway (/sync/*).
+
+    Доменной логики (подбор skill, поиск по опыту, сбор контекста, промптинг) в
+    виде сетевого API НЕТ: это внутренние tools агентного цикла, а не HTTP-
+    эндпоинты. Как и в MVP, единственный внешний вызов от агента к модели —
+    /v1/chat/completions; в production добавляются ops- и sync-контуры.
+
+    Инвариант приватности: код проектов, диалоги и артефакты НЕ покидают машину
+    инженера. В центр (/sync/*) уходят только обезличенные skills и статистика.
+
+servers:
+  - url: https://{host}:{port}
+    description: Local Gateway (AI Service на машине инженера)
+    variables:
+      host:
+        default: localhost
+        description: Хост Local Gateway
+      port:
+        default: "8080"
+        description: Порт Local Gateway
+  - url: https://{llm_host}:{llm_port}/v1
+    description: Self-hosted LLM Service (OpenAI-compatible), on-prem
+    variables:
+      llm_host:
+        default: llm.team.internal
+        description: Хост инференс-кластера (за LB)
+      llm_port:
+        default: "443"
+        description: Порт OpenAI-compatible сервера
+  - url: https://{central_host}:{central_port}
+    description: Central Gateway (командный сервер синхронизации)
+    variables:
+      central_host:
+        default: hermes-gateway.team.internal
+        description: Хост Central Gateway
+      central_port:
+        default: "8080"
+        description: Порт Central Gateway
+
+tags:
+  - name: llm
+    description: Фактический транспорт агент → self-hosted LLM (OpenAI-compatible)
+  - name: sync
+    description: Синхронизация Local ↔ Central Gateway (обезличенно)
+  - name: ops
+    description: Эксплуатация — health, readiness, метрики
+
+paths:
+  # ---------------- LLM transport ----------------
+  /v1/chat/completions:
+    post:
+      tags: [llm]
+      operationId: createChatCompletion
+      summary: Фактический вызов self-hosted LLM (OpenAI-compatible)
+      description: |
+        Так Local Gateway (LLM Router → LLM Client) реально обращается к
+        self-hosted LLM. Промпт собирается Prompt Assembler из skill, кодстайла
+        и найденного контекста. Ядро технологии — внутри периметра.
+      servers:
+        - url: https://{llm_host}:{llm_port}/v1
+          variables:
+            llm_host: { default: llm.team.internal }
+            llm_port: { default: "443" }
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: Ответ модели
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/ModelUnavailable' }
+
+  # ---------------- Ops ----------------
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: healthCheck
+      summary: Liveness probe
+      description: Жив ли процесс Gateway. Без авторизации, для k8s/systemd.
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Нездоров
+
+  /readyz:
+    get:
+      tags: [ops]
+      operationId: readinessCheck
+      summary: Readiness probe
+      description: |
+        Готов ли Gateway принимать трафик: доступность LLM-сервиса, Vector Index,
+        связь с Central Gateway (для Local).
+      security: []
+      responses:
+        '200':
+          description: Готов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Не готов
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: Prometheus-метрики
+      description: |
+        Экспозиция метрик в формате Prometheus (латентность LLM, tokens, доля
+        авто-применённых skills, GATE-исходы, sync-lag и др.). Скрейпится
+        Prometheus; доступ ограничен сетью/токеном скрейпера.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Метрики в text/plain (exposition format)
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ---------------- Sync (Local ↔ Central) ----------------
+  /sync/skills:
+    post:
+      tags: [sync]
+      operationId: pushSkills
+      summary: Push обезличенных skills в Central Gateway
+      description: |
+        Local Gateway отправляет успешные skills (confidence ≥ 0.8, usage ≥ 3) и
+        обезличенную статистику. НЕ передаются: код проектов, диалоги, артефакты,
+        личные заметки. На стороне Central — merge и conflict resolution.
+      servers:
+        - url: https://{central_host}:{central_port}
+          variables:
+            central_host: { default: hermes-gateway.team.internal }
+            central_port: { default: "8080" }
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillSyncPushRequest'
+      responses:
+        '200':
+          description: Результат применения (accepted / conflicts)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillSyncPushResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Конфликт версий skill
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [sync]
+      operationId: pullSkills
+      summary: Pull team best practices из Central Gateway
+      description: |
+        Local Gateway забирает обновлённые skills других инженеров (team best
+        practices). Поддерживает инкрементальный pull по since.
+      servers:
+        - url: https://{central_host}:{central_port}
+          variables:
+            central_host: { default: hermes-gateway.team.internal }
+            central_port: { default: "8080" }
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: since
+          in: query
+          description: ISO-8601 отметка последней синхронизации (инкрементальный pull)
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: min_confidence
+          in: query
+          required: false
+          schema:
+            type: number
+            minimum: 0
+            maximum: 1
+            default: 0.8
+      responses:
+        '200':
+          description: Обновлённые skills
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillSyncPullResponse'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /sync/status:
+    get:
+      tags: [sync]
+      operationId: syncStatus
+      summary: Статус синхронизации
+      description: Последняя синхронизация, размер очереди offline, число конфликтов.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Статус
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncStatus'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Production: JWT из IdP (OIDC SSO) либо сервис-токен из Vault.
+        RBAC-роли: engineer (свои сессии, применение skills), lead (ревью и
+        промоут skills, отчёты), admin (управление Central Gateway).
+        Промоут skill в team-scope через /sync/skills доступен только lead/admin.
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Неверный или отсутствующий токен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Недостаточно прав (RBAC)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Превышен лимит запросов
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Через сколько секунд повторить
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ModelUnavailable:
+      description: LLM недоступна (сервер не поднят / перегружен / fallback исчерпан)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ---------- LLM (OpenAI-compatible) ----------
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          example: qwen2.5-coder-32b-instruct
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          default: 0.2
+        max_tokens:
+          type: integer
+          minimum: 1
+          example: 4096
+        stream:
+          type: boolean
+          default: false
+
+    ChatMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content:
+          type: string
+
+    ChatCompletionResponse:
+      type: object
+      properties:
+        id: { type: string }
+        object:
+          type: string
+          example: chat.completion
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer }
+              message:
+                $ref: '#/components/schemas/ChatMessage'
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter]
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    Usage:
+      type: object
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        total_tokens: { type: integer }
+
+    # ---------- Sync ----------
+    SkillSyncPushRequest:
+      type: object
+      required: [skills]
+      properties:
+        engineer_id:
+          type: string
+          description: Обезличенный идентификатор инженера
+        skills:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillMetadata'
+        statistics:
+          type: object
+          description: Обезличенная статистика миграций (без кода и диалогов)
+          properties:
+            migrations_success:
+              type: integer
+            migrations_failed:
+              type: integer
+            avg_accuracy_loss:
+              type: number
+
+    SkillSyncPushResponse:
+      type: object
+      properties:
+        accepted:
+          type: array
+          items:
+            type: string
+        conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillConflict'
+
+    SkillSyncPullResponse:
+      type: object
+      properties:
+        skills:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillMetadata'
+        server_time:
+          type: string
+          format: date-time
+
+    SkillConflict:
+      type: object
+      properties:
+        name: { type: string }
+        local_version: { type: string }
+        central_version: { type: string }
+        resolution:
+          type: string
+          enum: [central_wins, local_wins, needs_review]
+
+    SkillMetadata:
+      type: object
+      required: [name, version, confidence]
+      properties:
+        name:
+          type: string
+          example: conv2d_int8_quantization
+        version:
+          type: string
+          example: "2.1"
+        tags:
+          type: array
+          items:
+            type: string
+        phase:
+          type: string
+          description: |
+            Фаза протокола (из AGENTS.md/навигатора), к которой релевантен skill.
+            Связывает накопленный опыт с процессом, не смешивая слои: на текущей
+            фазе Skills Manager подтягивает только skills с этим тегом.
+          example: phase-02-map-split
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        usage_count:
+          type: integer
+        success_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        target_platforms:
+          type: array
+          items:
+            type: string
+        marked_as_best_practice:
+          type: boolean
+
+    SyncStatus:
+      type: object
+      properties:
+        last_sync:
+          type: string
+          format: date-time
+        pending_updates:
+          type: integer
+        offline_queue_size:
+          type: integer
+        conflicts:
+          type: integer
+
+    # ---------- Ops ----------
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        version:
+          type: string
+
+    Readiness:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [up, down]
+          example:
+            llm: up
+            vector_index: up
+            central_gateway: up
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            trace_id:
+              type: string
+              description: ID трейса для разбора инцидента в наблюдаемости
