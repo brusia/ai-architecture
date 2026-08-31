@@ -27,7 +27,9 @@ jobs:
 
       - name: Generate static C4 site
         run: |
+          mkdir -p build/site
           docker run --rm \
+            --user "$(id -u):$(id -g)" \
             -v "${{ github.workspace }}:/var/model" \
             -w /var/model \
             ghcr.io/avisi-cloud/structurizr-site-generatr:latest \
