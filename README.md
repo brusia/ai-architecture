@@ -28,3 +28,6 @@
 DS-инженер либо инженер оптимизации (вместо ручной интеграции он использует агента, автоматизирующего большую часть работы).
 
 - [Разработка стратегии, оценка рисков и дорожной карты AI-проекта](docs/strategy_and_roadmap/strategy.md)
+- [ADR-001: Выбор способа хостинга LLM (SaaS vs Self-hosted)](docs/decisions/adr-001-llm-hosting.md)
+- [ADR-002: Пайплайн данных для обновления «опыта агента» (team-memory)](docs/decisions/adr-002-data-pipeline-for-agent-experience.md)
+- [ADR-003: Гибридная топология раздачи skills-банка (Central Gateway)](docs/decisions/adr-003-hybrid-skill-distribution-gateway.md)
