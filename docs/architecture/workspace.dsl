@@ -45,6 +45,11 @@ workspace "Migration Copilot" "Агентный ассистент для инт
             miglib = softwareSystem "Библиотека migration" "Носитель неизменного процесса миграции: навигатор AGENTS.md, пофазные инструкции (phase-файлы), JSON-схемы и API-контракты в METADATA. Определяет, что и в каком порядке делает агент, но не хранит накопленный опыт" {
                 tags "Library"
             }
+
+            // Eval Harness: сценарные тесты и тесты безопасности (ADR-005), запускаются в существующем CI
+            evals = softwareSystem "Eval Harness" "Эталонный набор репозиториев (golden set), сценарии миграции и набор атак для проверки безопасности. Считает метрики качества (Task Success, API Faithfulness, Step Relevance и др.) и блокирует merge в skills_distribution при падении ниже порога. Запускается задачами существующего CI (ADR-005)" {
+                tags "Repo"
+            }
         }
 
         // =====================================================================
@@ -111,15 +116,20 @@ workspace "Migration Copilot" "Агентный ассистент для инт
             gate_plugin = container "Migration Gate Plugin" "Плагин-инструмент уровня агента (наш единственный существенный код). Регистрируется как ~memory и ~todo, перехватывается AIAgent до обычной диспетчеризации в registry. Даёт то, чего нет в Hermes «из коробки»: блокирующий GATE (а не дисциплину на уровне промпта) и числовую проверку допусков по diff (а не «модель сама посчитает в уме»)" "Python-плагин, ~/.hermes/plugins/ или .hermes/plugins/" {
                 gate_tool = component "Инструмент migration_gate" "Инструмент с параметром action (status, confirm_gate, record_diff, choose_platforms), по аналогии с memory(action=add/replace/remove). confirm_gate физически не возвращает управление модели без явного подтверждения инженера: тот же механизм approval-callback, что инструмент терминала использует для опасных команд" "инструмент уровня агента"
                 gate_tolerance = component "Tolerance Judge" "torch-onnx=1e-4, onnx-engine=1e-2, torch-engine=1e-2: проверка в коде, а не в LLM. Получает структурированный JSON от субагента (через delegate_task и наш контракт в промпте «верни строго {ok,summary,diffs}») и сам решает: допустимо или вне допуска" "чистая функция"
+                gate_policy = component "Command Policy" "Правила для вызовов терминала и git до выполнения: запрет деструктивных команд вне списка, запись только внутри репозитория модели, git push только в ветку migrate-<model> и без --force, сетевые обращения только к разрешённым хостам. Реализуется хуком pre_tool_call, который может заблокировать вызов до выполнения; если хук не ответил вовремя, вызов блокируется. Дополняет встроенное обнаружение опасных команд Hermes (ADR-005)" "хук pre_tool_call, правила в конфиге"
+                gate_context_guard = component "Context Guard" "Обрабатывает результаты инструментов до попадания в контекст модели: добавляет наши правила секретов (токены ClearML и GitLab, внутренние хосты) поверх встроенного маскирования Hermes и оборачивает недоверенный контент (код репозитория, логи ClearML, вывод команд) в явные границы с пометкой. Срабатывание фиксируется событием телеметрии (ADR-005)" "хуки transform_tool_result и transform_terminal_output"
+                gate_api_check = component "API Check" "Перед завершением хода, в котором агент правил код, сверяет вызовы библиотеки migration в изменённых файлах с контрактами METADATA. Если вызова нет в контрактах, возвращает агента на доработку (встроенный предел Hermes: не более 3 раз за ход). Даёт метрику API Faithfulness прямо в потоке работы (ADR-005)" "хук pre_verify"
+                gate_budget = component "Token Budget" "Считает токены по ответам провайдера и при превышении лимита на сессию или фазу блокирует вызовы инструментов, так что цикл заканчивается. Работает вместе со встроенным лимитом итераций Hermes (max_iterations). Жёсткий лимит дополнительно можно поставить на балансировщике перед LLM (ADR-005)" "хуки post_api_request и pre_tool_call"
+                gate_telemetry = component "Telemetry Exporter" "Подписывается на observer hooks Hermes (провайдер, инструменты, подтверждения, субагенты, skills) и добавляет события GATE, допусков и защитных компонентов. Отдаёт метрики для Prometheus и трассы OTEL. Только числа и малокардинальные метки (phase, model, skill, tool, status, role, team), тела промптов, ответов и код не экспортируются; сессии различаются только в трассах и логах. Роль и команда берутся из локальной конфигурации профиля, личный ключ в метки не попадает. Стоимость запроса считает по токенам, так как Hermes не оценивает стоимость локальных моделей (ADR-005)" "observer hooks, Prometheus, OTLP"
                 gate_state = component "State Writer" "Пишет MIGRATION_STATE.md при каждом confirm_gate. Файловый контракт тот же, что в MVP, для совместимости с библиотекой migration и ручным чтением человеком" "файл состояния"
             }
 
             // --- Distribution: как это раздаётся в команде (задокументированная практика Hermes) ---
-            skills_distribution = container "migration-copilot Distribution" "Git-репозиторий Profile Distribution (рекомендованная практика Hermes для сценария «команда поставляет проверенного внутреннего агента»; их собственный пример: бот для PR-ревью). Содержит то, что принадлежит дистрибуции: SOUL.md, config.yaml, skills/ (14 фаз), gate_plugin. Никогда не содержит memories, sessions, auth.json и .env: они принадлежат пользователю, остаются у каждого инженера локально и не покидают машину" "git-репозиторий, distribution.yaml" {
+            skills_distribution = container "eai-migration-copilot Distribution" "Git-репозиторий Profile Distribution (рекомендованная практика Hermes для сценария «команда поставляет проверенного внутреннего агента»; их собственный пример: бот для PR-ревью). Содержит то, что принадлежит дистрибуции: SOUL.md, config.yaml, skills/ (14 фаз), gate_plugin. Никогда не содержит memories, sessions, auth.json и .env: они принадлежат пользователю, остаются у каждого инженера локально и не покидают машину" "git-репозиторий, distribution.yaml" {
                 tags "Repo"
             }
 
-            hermes_llm = container "Сервис LLM (self-hosted)" "Кластер инференса. Hermes сам не диктует, где хостить модель, а задаёт только протокол доступа (OpenAI-compatible /v1)" "on-prem, совместим с OpenAI /v1" {
+            hermes_llm = container "Сервис LLM (self-hosted)" "Кластер инференса, общий для всех инженеров. Hermes сам не диктует, где хостить модель, а задаёт только протокол доступа (OpenAI-compatible /v1). Принимает запросы только с личным ключом инженера: по ключу различаются сессии, ведётся учёт использования по ролям и командам и ограничивается нагрузка, чтобы один пользователь не занял весь ресурс (ADR-005)" "on-prem, совместим с OpenAI /v1, доступ по личному ключу" {
                 tags "LLM"
             }
 
@@ -140,9 +150,20 @@ workspace "Migration Copilot" "Агентный ассистент для инт
             hermes_agent.hermes_loop -> hermes_agent.hermes_skills "skills_list() / skill_view(name[, path])"
             hermes_agent.hermes_loop -> hermes_agent.hermes_memory "Заметки под управлением агента (не наше состояние GATE)"
             hermes_agent.hermes_loop -> hermes_agent.hermes_fallback "Провайдер недоступен: переключение на резервного"
-            hermes_agent.hermes_loop -> hermes_llm "Вызов API (chat_completions / anthropic_messages)"
+            hermes_agent.hermes_loop -> hermes_llm "Вызов API (chat_completions / anthropic_messages) с личным ключом инженера"
             hermes_agent.hermes_fallback -> hermes_llm "Резервный инстанс при 429, 5xx, 401, 403"
 
+            hermes_agent.hermes_loop -> gate_plugin.gate_policy "Вызов инструмента: проверка до выполнения (хук pre_tool_call)"
+            gate_plugin.gate_policy -> hermes_agent.hermes_loop "Решение: разрешить, потребовать подтверждение или заблокировать"
+            gate_plugin.gate_budget -> gate_plugin.gate_policy "Лимит токенов исчерпан: инструменты блокируются"
+            hermes_agent.hermes_loop -> gate_plugin.gate_budget "Токены из ответа провайдера (хук post_api_request)"
+            hermes_agent.hermes_loop -> gate_plugin.gate_context_guard "Результат инструмента до добавления в контекст модели (хуки transform_tool_result, transform_terminal_output)"
+            gate_plugin.gate_context_guard -> hermes_agent.hermes_loop "Очищенный и размеченный результат"
+            hermes_agent.hermes_loop -> gate_plugin.gate_api_check "Перед завершением хода с правками кода (хук pre_verify)"
+            gate_plugin.gate_api_check -> hermes_agent.hermes_loop "Вернуть на доработку, если вызов API не найден в контрактах (не более 3 раз)"
+            gate_plugin.gate_api_check -> miglib "Сверка вызовов с контрактами METADATA"
+            hermes_agent.hermes_loop -> gate_plugin.gate_telemetry "События провайдера, инструментов, подтверждений, субагентов и skills (observer hooks)"
+            gate_plugin.gate_telemetry -> obs "Метрики для Prometheus, трассы OTEL" "Prometheus / OTLP"
             hermes_agent.hermes_loop -> gate_plugin.gate_tool "tool_call: migration_gate(action=..., ...), перехвачено до registry, как memory и todo"
             gate_plugin.gate_tool -> gate_plugin.gate_tolerance "diff: допустимо или вне допуска"
             gate_plugin.gate_tool -> gate_plugin.gate_state "Подтверждённый GATE: запись прогресса"
@@ -168,7 +189,7 @@ workspace "Migration Copilot" "Агентный ассистент для инт
         // Один профиль для обеих ролей: роль определяется тем, какую фазу
         // протокола сейчас проходят (0-11 или 12+), а не разными профилями Hermes.
         // Передача работы это ручная эстафета на конкретном GATE.
-        engineer -> prod.hermes_agent "hermes -p migration-copilot chat; подтверждает GATE (фазы 0-11)" "терминал / CLI"
+        engineer -> prod.hermes_agent "hermes -p eai-migration-copilot chat; подтверждает GATE (фазы 0-11)" "терминал / CLI"
         mlops -> prod.hermes_agent "Тот же профиль, с фазы CI (12+); принимает работу после сравнения" "терминал / CLI"
 
         // Ревью содержания: двойной approve на каждый PR со skill независимо
@@ -195,9 +216,14 @@ workspace "Migration Copilot" "Агентный ассистент для инт
         prod -> miglib "Библиотека migration генерирует project-skills дистрибуции (phase-NN в SKILL.md)" "кодогенерация при релизе библиотеки"
         prod -> registry "Ставит библиотеку, публикует артефакты .onnx и .engine" "pip/uv, загрузка"
 
-        prod.hermes_agent -> obs "Метрики и логи (если настроен OTLP-плагин; Hermes сам пишет логи в agent.log)" "OTLP / scrape, опционально"
+        ci -> evals "Запускает eval-прогон: PR со skill, смена модели LLM, обновление Hermes или библиотеки migration, ночной прогон" "GitLab CI job"
+        prod.skills_distribution -> evals "PR со skill запускает обязательный eval-прогон: merge блокируется при падении метрик ниже порога" "CI, проверка перед merge"
+        evals -> prod.hermes_agent "Прогоняет сценарии миграции и атаки на эталонных репозиториях в песочнице" "CLI, изолированное окружение"
+        evals -> obs "Публикует метрики качества (Task Success, API Faithfulness и др.)" "Pushgateway"
+        skillsOwner -> evals "Ведёт эталонный набор и пороги метрик" "git"
         prod.gateway -> obs "Метрики внедрения и аналитики: доля команды на актуальной версии, доля успешных применений skills" "OTLP / scrape"
         prod.skills_distribution -> idp "Приватный git-репозиторий, доступ через существующую git-аутентификацию (SSH/PAT), без отдельного контура OIDC" "git auth (SSH/PAT)"
+        prod.hermes_llm -> idp "Проверка личных ключей доступа к LLM; при онбординге ключ выдаётся с атрибутами роли и команды, при уходе инженера отзывается" "OIDC / service auth, Vault"
         prod.gateway -> idp "Аутентификация для Gateway API (profile update, rollback), RBAC: rollback только для роли Skills Owner" "OIDC / service auth"
 
         // =====================================================================
@@ -211,10 +237,10 @@ workspace "Migration Copilot" "Агентный ассистент для инт
         deploymentEnvironment "Production" {
 
             deploymentNode "Рабочая станция инженера" "" "Linux / macOS" {
-                deploymentNode "Процесс профиля Hermes" "" "hermes -p migration-copilot" {
+                deploymentNode "Процесс профиля Hermes" "" "hermes -p eai-migration-copilot" {
                     containerInstance prod.hermes_agent
                 }
-                deploymentNode "Локальный профиль (~/.hermes/profiles/migration-copilot)" "" "на диске, данные пользователя исключены из skills_distribution" {
+                deploymentNode "Локальный профиль (~/.hermes/profiles/eai-migration-copilot)" "" "на диске, данные пользователя (в том числе личный ключ доступа к LLM) исключены из skills_distribution" {
                     containerInstance prod.gate_plugin
                 }
             }
@@ -230,7 +256,7 @@ workspace "Migration Copilot" "Агентный ассистент для инт
             }
 
             deploymentNode "Кластер инференса LLM" "GPU-узлы, on-prem" "" {
-                deploymentNode "Балансировщик нагрузки" "проверка состояния и переключение при отказе" "" {
+                deploymentNode "Балансировщик нагрузки" "проверка состояния, переключение при отказе, учёт и лимиты нагрузки по личному ключу" "" {
                     deploymentNode "Основная зона" "GPU-узлы" "" {
                         containerInstance prod.hermes_llm
                     }
@@ -272,6 +298,12 @@ workspace "Migration Copilot" "Агентный ассистент для инт
             include *
             autolayout lr
             description "C3, компоненты (Production): Central Gateway. Release Manifest Service (тонкий слой метаданных над git), Adoption Tracker и Skill Analytics Aggregator (обезличенные метрики), Rollback Trigger (узкая операция с аудитом для Skills Owner)"
+        }
+
+        component prod.gate_plugin "Prod_C3_Component_GatePlugin" {
+            include *
+            autolayout lr
+            description "C3, компоненты (Production): Migration Gate Plugin. GATE и проверка допусков, Command Policy (pre_tool_call), Context Guard (очистка результатов инструментов), API Check (pre_verify), Token Budget и Telemetry Exporter (observer hooks). Все защитные компоненты работают внутри процесса Hermes на хуках (ADR-005)"
         }
 
         deployment prod "Production" "Prod_C4_Deployment" {
@@ -329,6 +361,21 @@ workspace "Migration Copilot" "Агентный ассистент для инт
 
             autolayout lr
             description "Путь одного факта в MEMORY.md и USER.md: по умолчанию остаётся локальным навсегда (жёстко исключён из skills_distribution, «инвариант, покрытый регрессионными тестами» в терминах Hermes). Единственный путь до команды: вручную переписать как skill и пройти PR-процесс с предыдущей диаграммы"
+        }
+
+        // Последовательность: один вызов инструмента под защитой плагина и телеметрия (ADR-005).
+        dynamic prod.gate_plugin "Prod_Guarded_Tool_Call" {
+            prod.hermes_agent -> prod.gate_plugin.gate_policy "1. Модель запросила инструмент: хук pre_tool_call передаёт имя и аргументы"
+            prod.gate_plugin.gate_policy -> prod.hermes_agent "2. Решение: разрешить, потребовать подтверждение или заблокировать (если хук не ответил вовремя, вызов блокируется)"
+            prod.hermes_agent -> prod.gate_plugin.gate_context_guard "3. Инструмент выполнен: результат проходит очистку и разметку до попадания в контекст модели"
+            prod.gate_plugin.gate_context_guard -> prod.hermes_agent "4. В контекст попадает очищенный и размеченный результат"
+            prod.hermes_agent -> prod.gate_plugin.gate_telemetry "5. Observer hooks: статус, длительность, токены ответа провайдера"
+            prod.gate_plugin.gate_telemetry -> obs "6. Метрики для Prometheus и трассы OTEL"
+            prod.hermes_agent -> prod.gate_plugin.gate_api_check "7. Перед завершением хода с правками кода: сверка вызовов библиотеки с контрактами METADATA"
+            prod.gate_plugin.gate_api_check -> prod.hermes_agent "8. Если вызова нет в контрактах, агент возвращается на доработку"
+
+            autolayout lr
+            description "Путь одного вызова инструмента: проверка политики до выполнения, очистка результата до попадания в контекст, телеметрия и проверка API перед завершением хода. Всё работает внутри процесса Hermes на хуках (ADR-005)"
         }
 
         // ---------- MVP views ----------
